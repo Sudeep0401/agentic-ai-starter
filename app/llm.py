@@ -5,33 +5,40 @@ from openai import OpenAI
 from app.config import settings
 
 
-SYSTEM_PROMPT = """You are a teaching-oriented AI agent.
+SYSTEM_PROMPT = """
+You are the reasoning engine of a simple Agentic AI system.
 
-You are part of an agent loop.
+You do NOT have native tools.
+You do NOT have function calling.
+You must NOT generate tool calls.
+
+Your job is ONLY to decide the next action and return plain JSON text.
 
 Available tools:
-- calculator: deterministic arithmetic
-- search: retrieve a URL's text for demonstration purposes
+
+1. calculator
+Purpose:
+Perform mathematical calculations.
+
+2. search
+Purpose:
+Retrieve text from a URL.
 
 IMPORTANT:
-You are NOT directly connected to these tools.
+The Python agent will execute the tool.
+You only tell the Python agent WHAT to execute.
 
-You must NEVER use native function calling or native tool calling.
-
-Instead, communicate the requested action using ONLY the JSON format below.
-
-When a tool is needed:
+For a calculation, return exactly:
 
 {
   "action": "tool",
   "tool_name": "calculator",
   "arguments": {
-    "a": 25,
-    "b": 4
+    "expression": "25 * 4"
   }
 }
 
-For the search tool:
+For URL search, return exactly:
 
 {
   "action": "tool",
@@ -41,35 +48,41 @@ For the search tool:
   }
 }
 
-When you can answer directly:
+After receiving a tool result, return:
 
 {
   "action": "final",
-  "answer": "your answer here"
+  "answer": "25 multiplied by 4 is 100."
 }
 
-Rules:
-1. Always return exactly one JSON object.
-2. Do not return Markdown.
-3. Do not return code fences.
-4. Do not use native function calling.
-5. Do not invent tool results.
-6. Use calculator for arithmetic.
-7. Use search when the user asks to retrieve information from a URL.
-8. If a tool result is provided, use that result to continue the task.
-9. If the tool result contains the answer, return a final response.
+If no tool is required, return:
+
+{
+  "action": "final",
+  "answer": "your answer"
+}
+
+STRICT RULES:
+
+- Return ONLY one JSON object.
+- Never return Markdown.
+- Never return code fences.
+- Never return {"name": "tool", ...}.
+- Never return function calls.
+- Never use native tool calling.
+- Never invent a tool result.
+- The Python application executes tools.
+- For arithmetic, use the calculator tool.
 """
 
 
 class LLMClient:
+
     def __init__(self, client=None):
-        self.client = client or (
-            OpenAI(
-                api_key=settings.groq_api_key,
-                base_url=settings.groq_base_url,
-            )
-            if settings.groq_api_key
-            else None
+
+        self.client = client or OpenAI(
+            api_key=settings.groq_api_key,
+            base_url=settings.groq_base_url,
         )
 
     def decide(
@@ -78,35 +91,15 @@ class LLMClient:
         memory: list[dict],
         tool_result=None,
     ) -> dict:
-        """
-        Ask the LLM to decide the next step.
-
-        The LLM returns a JSON decision:
-
-        {
-            "action": "tool",
-            "tool_name": "...",
-            "arguments": {...}
-        }
-
-        OR:
-
-        {
-            "action": "final",
-            "answer": "..."
-        }
-        """
-
-        if not self.client:
-            return self._offline_decision(user_message)
 
         context = {
-            "memory": memory,
             "user_message": user_message,
+            "memory": memory,
             "tool_result": tool_result,
         }
 
         try:
+
             response = self.client.chat.completions.create(
                 model=settings.groq_model,
                 messages=[
@@ -125,60 +118,43 @@ class LLMClient:
                 temperature=0,
             )
 
-            text = response.choices[0].message.content.strip()
+            text = response.choices[0].message.content
 
-            # Remove accidental Markdown code fences.
+            if not text:
+                raise RuntimeError(
+                    "Groq returned an empty response."
+                )
+
+            text = text.strip()
+
+            # Remove accidental Markdown fences.
             if text.startswith("```"):
                 text = text.replace("```json", "")
                 text = text.replace("```", "")
                 text = text.strip()
 
-            try:
-                result = json.loads(text)
+            result = json.loads(text)
 
-                if not isinstance(result, dict):
-                    return {
-                        "action": "final",
-                        "answer": text,
-                    }
+            if not isinstance(result, dict):
+                raise ValueError(
+                    "Groq response is not a JSON object."
+                )
 
-                return result
+            if "action" not in result:
+                raise ValueError(
+                    "Groq response does not contain 'action'."
+                )
 
-            except json.JSONDecodeError:
-                return {
-                    "action": "final",
-                    "answer": text,
-                }
+            return result
+
+        except json.JSONDecodeError as exc:
+
+            raise RuntimeError(
+                f"Groq returned invalid JSON: {text}"
+            ) from exc
 
         except Exception as exc:
-            raise RuntimeError(f"LLM request failed: {exc}") from exc
 
-    @staticmethod
-    def _offline_decision(user_message: str) -> dict:
-        """
-        Offline fallback for classroom demonstrations.
-
-        Allows students to run the project without an API key.
-        """
-
-        lowered = user_message.lower()
-
-        if "calculate" in lowered or any(
-            operator in lowered
-            for operator in ["+", "*", "/", "-"]
-        ):
-            return {
-                "action": "final",
-                "answer": (
-                    "Offline mode is active. Add GROQ_API_KEY "
-                    "to enable LLM-driven tool selection."
-                ),
-            }
-
-        return {
-            "action": "final",
-            "answer": (
-                "Offline mode is active. Add GROQ_API_KEY "
-                "to connect a Groq-hosted LLM."
-            ),
-        }
+            raise RuntimeError(
+                f"LLM request failed: {exc}"
+            ) from exc
